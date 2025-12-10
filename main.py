@@ -92,7 +92,7 @@ def build_pptx(payload: CreatePptxInput, output_path: str):
                 p.text = bullet
                 p.level = 0
 
-        # Images
+               # Images
         if s.images:
             top = Inches(2.8)
             max_width = Inches(6.5)
@@ -101,14 +101,58 @@ def build_pptx(payload: CreatePptxInput, output_path: str):
                 try:
                     stream = fetch_image_bytes(str(img.url))
 
+                    # Choose picture sizing
                     if img.width_inch and img.height_inch:
                         pic = slide.shapes.add_picture(
-                            stream, Inches(0.5), top,
-                            width=Inches(img.width_inch), height=Inches(img.height_inch)
+                            stream,
+                            Inches(0.5),
+                            top,
+                            width=Inches(img.width_inch),
+                            height=Inches(img.height_inch)
                         )
                     elif img.width_inch:
                         pic = slide.shapes.add_picture(
-                            stream, Inches(0.5), top, width=Inches(img.width_inch)
+                            stream,
+                            Inches(0.5),
+                            top,
+                            width=Inches(img.width_inch)
                         )
                     elif img.height_inch:
-                        pic = slide.shapes.
+                        pic = slide.shapes.add_picture(
+                            stream,
+                            Inches(0.5),
+                            top,
+                            height=Inches(img.height_inch)
+                        )
+                    else:
+                        # Default — scale to width 6.5"
+                        pic = slide.shapes.add_picture(
+                            stream,
+                            Inches(1),
+                            top,
+                            width=max_width
+                        )
+
+                    # Center the image horizontally
+                    pic.left = int((prs.slide_width - pic.width) / 2)
+
+                    # Optional caption
+                    if img.caption:
+                        cap = slide.shapes.add_textbox(
+                            pic.left,
+                            pic.top + pic.height + Inches(0.1),
+                            pic.width,
+                            Inches(0.4)
+                        )
+                        cap_tf = cap.text_frame
+                        cap_tf.text = img.caption
+                        cap_tf.paragraphs[0].runs[0].font.size = Pt(12)
+
+                    # Move top down for next image
+                    top = pic.top + pic.height + Inches(0.4)
+
+                except Exception as e:
+                    p = body.add_paragraph()
+                    p.text = f"[Image failed: {img.url}]"
+                    p.level = 0
+
