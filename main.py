@@ -8,16 +8,12 @@ import os, uuid, io, requests
 
 app = FastAPI()
 
-# -----------------------
-# ROOT HEALTH CHECK ROUTE
-# -----------------------
+# Health check so "/" and "/docs" are easy to find
 @app.get("/")
 def health():
     return {"status": "ok", "endpoints": ["/docs", "/pptx/create"]}
 
-# -----------------------
-# DATA MODELS
-# -----------------------
+# ---- Models ----
 class ImageItem(BaseModel):
     url: HttpUrl
     width_inch: Optional[float] = None
@@ -35,43 +31,20 @@ class CreatePptxInput(BaseModel):
     slides: List[SlideItem]
     footer: Optional[str] = None
 
-# Directory to store generated PPTX files
 FILES_DIR = "generated"
 os.makedirs(FILES_DIR, exist_ok=True)
 
-# -----------------------
-# IMAGE FETCH HELPER
-# -----------------------
 def fetch_image_bytes(url: str) -> io.BytesIO:
-    headers = {"User-Agent": "Mozilla/5.0 (pptx-generator/1.0)"}
-    r = requests.get(url, headers=headers, timeout=15)
+    r = requests.get(url, headers={"User-Agent": "pptx-generator/1.0"}, timeout=15)
     r.raise_for_status()
-
-    ctype = r.headers.get("Content-Type", "").lower()
-    if not any(x in ctype for x in ["image/jpeg", "image/png", "image/gif", "application/octet-stream"]):
-        raise ValueError(f"Unsupported image content-type: {ctype}")
-
     return io.BytesIO(r.content)
 
-# -----------------------
-# FOOTER HELPER
-# -----------------------
-def add_footer(prs: Presentation, text: str):
-    for slide in prs.slides:
-        tx = slide.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.3))
-        run = tx.text_frame.paragraphs[0].add_run()
-        run.text = text
-        run.font.size = Pt(10)
-
-# -----------------------
-# PPTX BUILDER
-# -----------------------
 def build_pptx(payload: CreatePptxInput, output_path: str):
     prs = Presentation()
     title_layout = prs.slide_layouts[0]
     bullet_layout = prs.slide_layouts[1]
 
-    # Title Slide
+    # Title slide
     slide = prs.slides.add_slide(title_layout)
     slide.shapes.title.text = payload.title
     if payload.subtitle:
@@ -82,77 +55,63 @@ def build_pptx(payload: CreatePptxInput, output_path: str):
         slide = prs.slides.add_slide(bullet_layout)
         slide.shapes.title.text = s.heading[:255]
 
-        # Bullets
         body = slide.shapes.placeholders[1].text_frame
         body.clear()
         if s.bullets:
-            body.text = s.bullets[0]
-            for bullet in s.bullets[1:]:
+            body.text = s.bullets[0][:1000]
+            for b in s.bullets[1:]:
                 p = body.add_paragraph()
-                p.text = bullet
+                p.text = b[:1000]
                 p.level = 0
 
-               # Images
+        # Images (optional)
         if s.images:
             top = Inches(2.8)
             max_width = Inches(6.5)
-
             for img in s.images:
                 try:
                     stream = fetch_image_bytes(str(img.url))
-
-                    # Choose picture sizing
-                    if img.width_inch and img.height_inch:
-                        pic = slide.shapes.add_picture(
-                            stream,
-                            Inches(0.5),
-                            top,
-                            width=Inches(img.width_inch),
-                            height=Inches(img.height_inch)
-                        )
-                    elif img.width_inch:
-                        pic = slide.shapes.add_picture(
-                            stream,
-                            Inches(0.5),
-                            top,
-                            width=Inches(img.width_inch)
-                        )
-                    elif img.height_inch:
-                        pic = slide.shapes.add_picture(
-                            stream,
-                            Inches(0.5),
-                            top,
-                            height=Inches(img.height_inch)
-                        )
-                    else:
-                        # Default — scale to width 6.5"
-                        pic = slide.shapes.add_picture(
-                            stream,
-                            Inches(1),
-                            top,
-                            width=max_width
-                        )
-
-                    # Center the image horizontally
+                    pic = slide.shapes.add_picture(stream, Inches(1), top, width=max_width)
                     pic.left = int((prs.slide_width - pic.width) / 2)
-
-                    # Optional caption
                     if img.caption:
                         cap = slide.shapes.add_textbox(
-                            pic.left,
-                            pic.top + pic.height + Inches(0.1),
-                            pic.width,
-                            Inches(0.4)
+                            pic.left, pic.top + pic.height + Inches(0.1),
+                            pic.width, Inches(0.4)
                         )
-                        cap_tf = cap.text_frame
-                        cap_tf.text = img.caption
-                        cap_tf.paragraphs[0].runs[0].font.size = Pt(12)
-
-                    # Move top down for next image
+                        cap.text_frame.text = img.caption[:140]
+                        cap.text_frame.paragraphs[0].runs[0].font.size = Pt(12)
                     top = pic.top + pic.height + Inches(0.4)
-
-                except Exception as e:
+                except Exception:
                     p = body.add_paragraph()
                     p.text = f"[Image failed: {img.url}]"
                     p.level = 0
 
+    if payload.footer:
+        for s in prs.slides:
+            tx = s.shapes.add_textbox(Inches(0.5), Inches(6.8), Inches(9), Inches(0.3))
+            run = tx.text_frame.paragraphs[0].add_run()
+            run.text = payload.footer[:120]
+            run.font.size = Pt(10)
+
+    prs.save(output_path)
+
+@app.post("/pptx/create")
+async def create_pptx(payload: CreatePptxInput):
+    file_id = uuid.uuid4().hex
+    name = f"{file_id}.pptx"
+    path = os.path.join(FILES_DIR, name)
+    build_pptx(payload, path)
+
+    base = os.getenv("PUBLIC_BASE_URL", "https://pptx-api-8eqj.onrender.com")
+    return JSONResponse({"download_url": f"{base}/files/{name}", "file_name": name})
+
+@app.get("/files/{name}")
+async def serve_file(name: str):
+    path = os.path.join(FILES_DIR, name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=name
+    )
