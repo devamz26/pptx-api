@@ -6,31 +6,38 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 import os, uuid, io, requests
 
+# Image conversion helpers
+from PIL import Image
+
+# Optional SVG support
+try:
+    import cairosvg
+    HAS_CAIROSVG = True
+except Exception:
+    HAS_CAIROSVG = False
+
 app = FastAPI()
 
-# ---------------------------------
-# Root Health Check Route
-# ---------------------------------
+# -------------------------
+# Health route
+# -------------------------
 @app.get("/")
 def health():
     return {"status": "ok", "endpoints": ["/docs", "/pptx/create"]}
 
-
-# ---------------------------------
-# Data Models
-# ---------------------------------
+# -------------------------
+# Models
+# -------------------------
 class ImageItem(BaseModel):
     url: HttpUrl
     width_inch: Optional[float] = None
     height_inch: Optional[float] = None
     caption: Optional[str] = None
 
-
 class SlideItem(BaseModel):
     heading: str
     bullets: Optional[List[str]] = []
     images: Optional[List[ImageItem]] = []
-
 
 class CreatePptxInput(BaseModel):
     title: str
@@ -38,58 +45,84 @@ class CreatePptxInput(BaseModel):
     slides: List[SlideItem]
     footer: Optional[str] = None
 
-
+# -------------------------
+# Storage
+# -------------------------
 FILES_DIR = "generated"
 os.makedirs(FILES_DIR, exist_ok=True)
 
-
-# ---------------------------------
-# Robust Image Fetcher
-# ---------------------------------
+# -------------------------
+# Robust image fetcher + converter
+# -------------------------
 def fetch_image_bytes(url: str) -> io.BytesIO:
+    """
+    Download the image at `url` and return an in-memory file-like object
+    that python-pptx can embed (PNG/JPEG/GIF).
+    - Converts WebP -> PNG using Pillow.
+    - Converts SVG -> PNG using cairosvg if available.
+    - Follows redirects and uses a browser User-Agent.
+    """
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; PPTX-Generator/1.1; +https://pptx-api)",
+        "User-Agent": "Mozilla/5.0 (compatible; PPTX-Generator/1.2)",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
-
-    r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+    r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
     r.raise_for_status()
 
-    content_type = (r.headers.get("Content-Type") or "").lower()
+    ct = (r.headers.get("Content-Type") or "").lower()
+    url_l = url.lower()
 
-    supported = ("image/png", "image/jpeg", "image/jpg", "image/gif")
+    # SVG handling
+    if ("image/svg" in ct) or url_l.endswith(".svg"):
+        if not HAS_CAIROSVG:
+            raise ValueError("SVG image found but cairosvg not installed on server.")
+        # Convert SVG bytes to PNG bytes
+        png_bytes = cairosvg.svg2png(bytestring=r.content)
+        return io.BytesIO(png_bytes)
 
-    # Accept PNG/JPG/GIF, reject SVG/WebP because python-pptx cannot embed them
-    if not any(t in content_type for t in supported):
-        if not url.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
-            raise ValueError(f"Unsupported image type: {content_type}")
+    # WebP handling -> convert to PNG
+    if ("image/webp" in ct) or url_l.endswith(".webp"):
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
 
-    return io.BytesIO(r.content)
+    # PNG/JPEG/GIF passthrough
+    if any(t in ct for t in ("image/png", "image/jpeg", "image/jpg", "image/gif")):
+        return io.BytesIO(r.content)
 
+    # Fallback by extension
+    if url_l.endswith((".png", ".jpg", ".jpeg", ".gif")):
+        return io.BytesIO(r.content)
 
-# ---------------------------------
-# PPTX Builder
-# ---------------------------------
+    raise ValueError(f"Unsupported image type: {ct or 'unknown'}")
+
+# -------------------------
+# PPTX builder
+# -------------------------
 def build_pptx(payload: CreatePptxInput, output_path: str):
     prs = Presentation()
     title_layout = prs.slide_layouts[0]
     bullet_layout = prs.slide_layouts[1]
 
-    # Title Slide
+    # Title slide
     slide = prs.slides.add_slide(title_layout)
     slide.shapes.title.text = payload.title
     if payload.subtitle:
-        slide.placeholders[1].text = payload.subtitle
+        try:
+            slide.placeholders[1].text = payload.subtitle
+        except Exception:
+            pass
 
-    # Content Slides
+    # Content slides
     for s in payload.slides:
         slide = prs.slides.add_slide(bullet_layout)
         slide.shapes.title.text = s.heading[:255]
 
+        # Bullets
         body = slide.shapes.placeholders[1].text_frame
         body.clear()
-
-        # Bullets
         if s.bullets:
             body.text = s.bullets[0][:1000]
             for b in s.bullets[1:]:
@@ -101,35 +134,47 @@ def build_pptx(payload: CreatePptxInput, output_path: str):
         if s.images:
             top = Inches(2.8)
             max_width = Inches(6.5)
-
             for img in s.images:
                 try:
                     stream = fetch_image_bytes(str(img.url))
 
-                    # Auto-fitting image
-                    pic = slide.shapes.add_picture(
-                        stream, Inches(1), top, width=max_width
-                    )
+                    # Add picture, auto-fit to width
+                    if img.width_inch and img.height_inch:
+                        pic = slide.shapes.add_picture(
+                            stream, Inches(0.5), top,
+                            width=Inches(img.width_inch), height=Inches(img.height_inch)
+                        )
+                    elif img.width_inch:
+                        pic = slide.shapes.add_picture(
+                            stream, Inches(0.5), top, width=Inches(img.width_inch)
+                        )
+                    elif img.height_inch:
+                        pic = slide.shapes.add_picture(
+                            stream, Inches(0.5), top, height=Inches(img.height_inch)
+                        )
+                    else:
+                        pic = slide.shapes.add_picture(stream, Inches(1), top, width=max_width)
 
-                    # Center image
+                    # center horizontally
                     pic.left = int((prs.slide_width - pic.width) / 2)
 
-                    # Caption
+                    # caption
                     if img.caption:
-                        cap = slide.shapes.add_textbox(
-                            pic.left, pic.top + pic.height + Inches(0.1),
-                            pic.width, Inches(0.4)
-                        )
-                        cap.text_frame.text = img.caption[:140]
-                        cap.text_frame.paragraphs[0].runs[0].font.size = Pt(12)
+                        cap = slide.shapes.add_textbox(pic.left, pic.top + pic.height + Inches(0.08), pic.width, Inches(0.36))
+                        cap_tf = cap.text_frame
+                        cap_tf.text = img.caption[:200]
+                        try:
+                            cap_tf.paragraphs[0].runs[0].font.size = Pt(12)
+                        except Exception:
+                            pass
 
-                    top = pic.top + pic.height + Inches(0.4)
+                    top = pic.top + pic.height + Inches(0.24)
 
                 except Exception as e:
+                    # Put the error message into the slide to see why it failed
                     p = body.add_paragraph()
                     p.text = f"[Image failed: {img.url} — {str(e)}]"
                     p.level = 0
-
 
     # Footer
     if payload.footer:
@@ -141,10 +186,9 @@ def build_pptx(payload: CreatePptxInput, output_path: str):
 
     prs.save(output_path)
 
-
-# ---------------------------------
-# API Routes
-# ---------------------------------
+# -------------------------
+# Routes
+# -------------------------
 @app.post("/pptx/create")
 async def create_pptx(payload: CreatePptxInput):
     file_id = uuid.uuid4().hex
@@ -153,22 +197,12 @@ async def create_pptx(payload: CreatePptxInput):
 
     build_pptx(payload, path)
 
-    base_url = os.getenv("PUBLIC_BASE_URL", "https://pptx-api-8eqj.onrender.com")
-
-    return JSONResponse({
-        "download_url": f"{base_url}/files/{filename}",
-        "file_name": filename
-    })
-
+    base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
+    return JSONResponse({"download_url": f"{base_url}/files/{filename}", "file_name": filename})
 
 @app.get("/files/{filename}")
 async def serve_file(filename: str):
     path = os.path.join(FILES_DIR, filename)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(
-        path,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        filename=filename
-    )
+    return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", filename=filename)
