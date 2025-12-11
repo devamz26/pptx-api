@@ -2,3 +2,5 @@ fastapi
 uvicorn
 python-pptx
 requests
+Pillow
+cairosvg    # optional; only if you want SVG support
